@@ -39,9 +39,31 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
-  thought?: string;
   timestamp: number;
-  toolCalls?: ToolCallInfo[];
+  parts?: AssistantMessagePart[];
+}
+
+export type AssistantMessagePart =
+  | AssistantTextPart
+  | AssistantThoughtPart
+  | AssistantToolPart;
+
+export interface AssistantTextPart {
+  id: string;
+  type: 'text';
+  content: string;
+}
+
+export interface AssistantThoughtPart {
+  id: string;
+  type: 'thought';
+  content: string;
+}
+
+export interface AssistantToolPart {
+  id: string;
+  type: 'tool';
+  toolCall: ToolCallInfo;
 }
 
 export interface ToolCallInfo {

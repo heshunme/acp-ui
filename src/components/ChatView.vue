@@ -5,14 +5,14 @@ import { useSessionStore } from '../stores/session';
 import ModePicker from './ModePicker.vue';
 import ModelPicker from './ModelPicker.vue';
 import CommandPalette from './CommandPalette.vue';
-import type { SlashCommand } from '../lib/types';
+import type { ChatMessage, SlashCommand, AssistantMessagePart } from '../lib/types';
 
 const sessionStore = useSessionStore();
 const inputText = ref('');
 const messagesContainer = ref<HTMLElement | null>(null);
 const commandPaletteRef = ref<InstanceType<typeof CommandPalette> | null>(null);
 
-// Track expanded thought sections by message id
+// Track expanded thought sections by part id
 const expandedThoughts = ref<Set<string>>(new Set());
 
 const messages = computed(() => sessionStore.messageList);
@@ -108,15 +108,31 @@ async function handleModelChange(modelId: string) {
   }
 }
 
-function isThoughtExpanded(messageId: string): boolean {
-  return expandedThoughts.value.has(messageId);
+function getMessageParts(message: ChatMessage): AssistantMessagePart[] {
+  if (message.role !== 'assistant') {
+    return message.content
+      ? [{ id: `${message.id}-content`, type: 'text', content: message.content }]
+      : [];
+  }
+
+  if (message.parts?.length) {
+    return message.parts;
+  }
+
+  return message.content
+    ? [{ id: `${message.id}-content`, type: 'text', content: message.content }]
+    : [];
 }
 
-function toggleThought(messageId: string): void {
-  if (expandedThoughts.value.has(messageId)) {
-    expandedThoughts.value.delete(messageId);
+function isThoughtExpanded(partId: string): boolean {
+  return expandedThoughts.value.has(partId);
+}
+
+function toggleThought(partId: string): void {
+  if (expandedThoughts.value.has(partId)) {
+    expandedThoughts.value.delete(partId);
   } else {
-    expandedThoughts.value.add(messageId);
+    expandedThoughts.value.add(partId);
   }
 }
 
@@ -182,41 +198,38 @@ function getStatusIcon(status: string): string {
           <span class="role">{{ message.role === 'user' ? 'You' : 'Assistant' }}</span>
         </div>
         
-        <!-- Agent thinking section (collapsible) - shown first to explain reasoning -->
-        <div v-if="message.thought && message.role === 'assistant'" class="thought-section">
-          <button class="thought-toggle" @click="toggleThought(message.id)">
-            <span class="thought-icon">💭</span>
-            <span class="thought-label">{{ isThoughtExpanded(message.id) ? 'Hide Thinking' : 'Show Thinking' }}</span>
-            <span class="thought-chevron">{{ isThoughtExpanded(message.id) ? '▲' : '▼' }}</span>
-          </button>
-          <div v-if="isThoughtExpanded(message.id)" class="thought-content">
-            <div v-html="renderMarkdown(message.thought)" />
+        <template v-for="part in getMessageParts(message)" :key="part.id">
+          <div v-if="part.type === 'thought'" class="thought-section">
+            <button class="thought-toggle" @click="toggleThought(part.id)">
+              <span class="thought-icon">💭</span>
+              <span class="thought-label">{{ isThoughtExpanded(part.id) ? 'Hide Thinking' : 'Show Thinking' }}</span>
+              <span class="thought-chevron">{{ isThoughtExpanded(part.id) ? '▲' : '▼' }}</span>
+            </button>
+            <div v-if="isThoughtExpanded(part.id)" class="thought-content">
+              <div v-html="renderMarkdown(part.content)" />
+            </div>
           </div>
-        </div>
-        
-        <!-- Tool calls for this message (shown after thinking) -->
-        <div v-if="message.toolCalls?.length" class="tool-calls-section">
-          <div 
-            v-for="tc in message.toolCalls" 
-            :key="tc.toolCallId"
-            :class="['tool-call-inline', `tool-${tc.status}`]"
+          
+          <div
+            v-else-if="part.type === 'tool'"
+            :class="['tool-call-inline', `tool-${part.toolCall.status}`]"
           >
-            <span class="tool-icon">{{ getToolIcon(tc.kind) }}</span>
-            <span class="tool-name">{{ tc.title }}</span>
-            <span v-if="tc.locations?.length" class="tool-location">
-              {{ tc.locations[0].path }}
+            <span class="tool-icon">{{ getToolIcon(part.toolCall.kind) }}</span>
+            <span class="tool-name">{{ part.toolCall.title }}</span>
+            <span v-if="part.toolCall.locations?.length" class="tool-location">
+              {{ part.toolCall.locations[0].path }}
             </span>
-            <span :class="['tool-status', `status-${tc.status}`]">
-              {{ getStatusIcon(tc.status) }}
+            <span :class="['tool-status', `status-${part.toolCall.status}`]">
+              {{ getStatusIcon(part.toolCall.status) }}
             </span>
           </div>
-        </div>
-        
-        <div 
-          v-if="message.content"
-          class="message-content"
-          v-html="renderMarkdown(message.content)"
-        />
+
+          <div
+            v-else-if="part.content"
+            class="message-content"
+            v-html="renderMarkdown(part.content)"
+          />
+        </template>
       </div>
       
       <!-- Loading indicator -->
