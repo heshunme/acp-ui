@@ -4,7 +4,17 @@ import { ref, computed, watch } from 'vue';
 import { load, Store } from '@tauri-apps/plugin-store';
 import { getVersion } from '@tauri-apps/api/app';
 import { trackEvent, trackError } from '../lib/telemetry';
-import type { SavedSession, ChatMessage, ToolCallInfo, PermissionRequest, SessionMode, SlashCommand, ModelInfo } from '../lib/types';
+import type {
+  SavedSession,
+  ChatMessage,
+  ToolCallInfo,
+  PermissionRequest,
+  SessionMode,
+  SlashCommand,
+  ModelInfo,
+  AssistantMessagePart,
+  AssistantToolPart,
+} from '../lib/types';
 import { AcpClientBridge, createAcpClient } from '../lib/acp-bridge';
 import { spawnAgent, killAgent, onAgentStderr } from '../lib/tauri';
 import type { SessionNotification, AuthMethod } from '@agentclientprotocol/sdk';
@@ -31,6 +41,16 @@ function detectPhase(line: string): string | null {
     return 'starting';
   }
   return null;
+}
+
+function createAssistantMessage(): ChatMessage {
+  return {
+    id: crypto.randomUUID(),
+    role: 'assistant',
+    content: '',
+    timestamp: Date.now(),
+    parts: [],
+  };
 }
 
 export const useSessionStore = defineStore('session', () => {
@@ -110,6 +130,46 @@ export const useSessionStore = defineStore('session', () => {
   // Session update handler
   function handleSessionUpdate(notification: SessionNotification) {
     const update = notification.update;
+
+    const ensureAssistantMessage = (): ChatMessage => {
+      const lastMsg = messages.value[messages.value.length - 1];
+      if (lastMsg && lastMsg.role === 'assistant') {
+        if (!lastMsg.parts) {
+          lastMsg.parts = [];
+        }
+        return lastMsg;
+      }
+
+      const message = createAssistantMessage();
+      messages.value.push(message);
+      return message;
+    };
+
+    const appendAssistantPart = (
+      type: 'text' | 'thought',
+      content: string
+    ): void => {
+      if (!content) return;
+
+      const message = ensureAssistantMessage();
+      const parts = message.parts ?? [];
+      const lastPart = parts[parts.length - 1];
+
+      if (lastPart && lastPart.type === type) {
+        lastPart.content += content;
+      } else {
+        parts.push({
+          id: crypto.randomUUID(),
+          type,
+          content,
+        } as AssistantMessagePart);
+      }
+
+      message.parts = parts;
+      if (type === 'text') {
+        message.content += content;
+      }
+    };
     
     switch (update.sessionUpdate) {
       case 'user_message_chunk':
@@ -130,65 +190,33 @@ export const useSessionStore = defineStore('session', () => {
         break;
 
       case 'agent_message_chunk':
-        // Append to last assistant message or create new
-        const lastMsg = messages.value[messages.value.length - 1];
-        if (lastMsg && lastMsg.role === 'assistant') {
-          if (update.content.type === 'text') {
-            lastMsg.content += update.content.text;
-          }
-        } else {
-          messages.value.push({
-            id: crypto.randomUUID(),
-            role: 'assistant',
-            content: update.content.type === 'text' ? update.content.text : '',
-            timestamp: Date.now(),
-            toolCalls: [],
-          });
+        if (update.content.type === 'text') {
+          appendAssistantPart('text', update.content.text);
         }
         break;
 
       case 'agent_thought_chunk':
-        // Append to last assistant message's thought field or create new
-        const lastAssistantMsg = messages.value[messages.value.length - 1];
-        if (lastAssistantMsg && lastAssistantMsg.role === 'assistant') {
-          if (update.content.type === 'text') {
-            lastAssistantMsg.thought = (lastAssistantMsg.thought || '') + update.content.text;
-          }
-        } else {
-          messages.value.push({
-            id: crypto.randomUUID(),
-            role: 'assistant',
-            content: '',
-            thought: update.content.type === 'text' ? update.content.text : '',
-            timestamp: Date.now(),
-            toolCalls: [],
-          });
+        if (update.content.type === 'text') {
+          appendAssistantPart('thought', update.content.text);
         }
         break;
 
       case 'tool_call':
-        // Add tool call to the current assistant message
-        const currentAssistantMsg = messages.value[messages.value.length - 1];
-        if (currentAssistantMsg && currentAssistantMsg.role === 'assistant') {
-          if (!currentAssistantMsg.toolCalls) {
-            currentAssistantMsg.toolCalls = [];
-          }
-          currentAssistantMsg.toolCalls.push({
-            toolCallId: update.toolCallId,
-            title: update.title,
-            kind: update.kind || 'other',
-            status: update.status || 'pending',
-            locations: update.locations,
-          });
-        }
-        // Also keep in global map for updates
-        toolCalls.value.set(update.toolCallId, {
+        const toolCall: ToolCallInfo = {
           toolCallId: update.toolCallId,
           title: update.title,
           kind: update.kind || 'other',
           status: update.status || 'pending',
           locations: update.locations,
-        });
+        };
+        const currentAssistantMsg = ensureAssistantMessage();
+        const toolPart: AssistantToolPart = {
+          id: crypto.randomUUID(),
+          type: 'tool',
+          toolCall,
+        };
+        currentAssistantMsg.parts?.push(toolPart);
+        toolCalls.value.set(update.toolCallId, toolCall);
         break;
 
       case 'tool_call_update':
@@ -196,13 +224,15 @@ export const useSessionStore = defineStore('session', () => {
         if (existing) {
           if (update.status) existing.status = update.status;
           if (update.title) existing.title = update.title;
-          // Also update in the message's toolCalls array
           for (const msg of messages.value) {
-            if (msg.toolCalls) {
-              const tc = msg.toolCalls.find(t => t.toolCallId === update.toolCallId);
-              if (tc) {
-                if (update.status) tc.status = update.status;
-                if (update.title) tc.title = update.title;
+            if (msg.parts) {
+              const toolPart = msg.parts.find(
+                part => part.type === 'tool' && part.toolCall.toolCallId === update.toolCallId
+              );
+              if (toolPart && toolPart.type === 'tool') {
+                if (update.status) toolPart.toolCall.status = update.status;
+                if (update.title) toolPart.toolCall.title = update.title;
+                if (update.locations) toolPart.toolCall.locations = update.locations;
               }
             }
           }
